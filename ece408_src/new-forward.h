@@ -9,7 +9,6 @@ namespace mxnet
 namespace op
 {
 
-
 template <typename cpu, typename DType>
 void forward(mshadow::Tensor<cpu, 4, DType> &y, const mshadow::Tensor<cpu, 4, DType> &x, const mshadow::Tensor<cpu, 4, DType> &k)
 {
@@ -21,23 +20,45 @@ void forward(mshadow::Tensor<cpu, 4, DType> &y, const mshadow::Tensor<cpu, 4, DT
     */
 
     const int B = x.shape_[0];
-    // const int M = y.shape_[1];
-    // const int C = x.shape_[1];
-    // const int H = x.shape_[2];
-    // const int W = x.shape_[3];
-    // const int K = k.shape_[3];
+    const int M = y.shape_[1];
+    const int C = x.shape_[1];
+    const int H = x.shape_[2];
+    const int W = x.shape_[3];
+    const int K = k.shape_[3];
 
-    for (int b = 0; b < B; ++b) {
+    for (int b = 0; b < B; ++b) //number of images
+    {
 
-        CHECK_EQ(0,1) << "Remove this line and replace it with your implementation.";
+        // CHECK_EQ(0,1) << "Remove this line and replace it with your implementation.";
 
         /* ... a bunch of nested loops later...
             y[b][m][h][w] += x[b][c][h + p][w + q] * k[m][c][p][q];
         */
+        for (int m = 0; m < M; ++m) //number of output feature maps
+        {
+            for (int h = 0; h < H; ++h) //height of output elements
+            {
+                for (int w = 0; w < W; ++w)//width of output element
+                {
+                    y[b][m][h][w] = 0; //sets output to be zero
+                    for (int c = 0; c < C; ++c) //num of input feature maps
+                    {
+                        for (int p = 0; p < K; ++p) //height of filter
+                        {
+                            for (int q = 0; q < K; ++q) //width of filter
+                            {
+                                y[b][m][h][w] += x[b][c][h + p][w + q] * k[m][c][p][q];
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
-
 }
-}
-}
+} // namespace op
+} // namespace mxnet
 
 #endif
+
+
