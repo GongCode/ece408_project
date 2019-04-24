@@ -28,23 +28,23 @@ forward_kernel(float *y, const float *x, const float *k, const int B, const int 
     const int W_out = W - K + 1;
 
     //helps us index the pointers
-#define y4d(i3, i2, i1, i0) y[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
-#define x4d(i3, i2, i1, i0) x[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
-#define k4d(i3, i2, i1, i0) k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
+#define y4d(i3, i2, i1, i0) y[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0] //index the output
+#define x4d(i3, i2, i1, i0) x[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]//index the input
+#define k4d(i3, i2, i1, i0) k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]//index the mask
 
-    n = blockIdx.x; //idx of images
-    m = blockIdx.y; //idx of features
-    const int H_Grid = ceil(H_out / (float)TILE_WIDTH);
+    n = blockIdx.x; //idx of input images
+    m = blockIdx.y; //idx of output features map
+    const int H_Grid = ceil(H_out / (float)TILE_WIDTH); //calculating how many blocks in the grid
     const int W_Grid = ceil(W_out / (float)TILE_WIDTH); //round up
-    h = blockIdx.z / (H_Grid)*TILE_WIDTH + threadIdx.y; //y idx of output tile
-    w = blockIdx.z % (W_Grid)*TILE_WIDTH + threadIdx.x; //x idx of output tile
+    h = blockIdx.z / (H_Grid)*TILE_WIDTH + threadIdx.y; //y idx of output tile (current height)
+    w = blockIdx.z % (W_Grid)*TILE_WIDTH + threadIdx.x; //x idx of output tile (current width)
 
     if (h >= H_out || w >= W_out)
         return;
 
     float total = 0.0;
 
-    //num of input feature maps
+    //num of input channel
     for (c = 0; c < C; c++)
     {
         //height of filter
@@ -84,19 +84,19 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tenso
 
     // Extract the tensor dimensions into B,M,C,H,W,K
 
-    const int B = x.shape_[0]; //number of output images
+    const int B = x.shape_[0]; //number of input images
     const int M = y.shape_[1]; //number of output feature maps
-    const int C = x.shape_[1]; //number of input feature maps
-    const int H = x.shape_[2]; //height of output elements
-    const int W = x.shape_[3]; //width of output element
-    const int K = w.shape_[3]; //dimension of the filters, width and height
+    const int C = x.shape_[1]; //number of input channels
+    const int H = x.shape_[2]; //height of input elements
+    const int W = x.shape_[3]; //width of input element
+    const int K = w.shape_[3]; //dimension of the mask, width and height
 
     // Set the kernel dimensions
-    const int H_out = H - K + 1; // the output after removing the edges
-    const int W_out = W - K + 1;
+    const int H_out = H - K + 1; // height of output elements
+    const int W_out = W - K + 1; //width of output elements
 
-    int W_grid = ceil(W_out / (float)TILE_WIDTH); // number of horizontal tiles per output map
-    int H_grid = ceil(H_out / (float)TILE_WIDTH); // number of vertical tiles per output map
+    int W_grid = ceil(W_out / (float)TILE_WIDTH); // number of horizontal tiles per output feature map
+    int H_grid = ceil(H_out / (float)TILE_WIDTH); // number of vertical tiles per output feature map
     int Z = H_grid * W_grid;
 
     printf("Num Output Feature Maps: %d ", M);
@@ -104,9 +104,10 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tenso
     printf(" Filter Size: %d ", K);
 
     dim3 blockDim(TILE_WIDTH, TILE_WIDTH, 1);
-    dim3 gridDim(B, M, Z); //num of output images, number of output feature maps, total tiles
+    dim3 gridDim(B, M, Z); //num of input images, number of output feature maps, total tiles
 
     // Call the kernel
+    //y is the output, x is the input, w is the masks
     forward_kernel<<<gridDim, blockDim>>>(y.dptr_, x.dptr_, w.dptr_, B, M, C, H, W, K);
 
     // Use MSHADOW_CUDA_CALL to check for CUDA runtime errors.
