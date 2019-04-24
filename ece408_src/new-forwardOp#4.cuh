@@ -84,9 +84,9 @@ unroll_kernel(int C, int H, int W, int H_out, int W_out, int X_unroll_cols, int 
 {
 
 #define x4d(i3, i2, i1, i0) X[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
-#define x_u4d(i2, i1, i0) X_unroll[(i2) * (X_unroll_cols*C*K*K) + (i1) * (X_unroll_cols) + i0]
+#define x_u4d(i2, i1, i0) X_unrolled[(i2) * (X_unroll_cols*C*K*K) + (i1) * (X_unroll_cols) + i0]
 
-  int c, s, h_out, w_out, h_unroll, w_unroll, h_base, p, q;
+  int c, s, h_out, w_out, h_unroll, w_unroll, w_base, p, q;
   int t = blockIdx.x * MAX_NUM_THREADS + threadIdx.x;
   int n = blockIdx.y; // index of images
   if (t<C*X_unroll_cols){
@@ -107,14 +107,14 @@ unroll_kernel(int C, int H, int W, int H_out, int W_out, int X_unroll_cols, int 
 }
 
 __global__ void
-matrix_multiply(float* Y, float* X_unrolled, float* K, K_unroll_rows, K_unroll_cols, X_unroll_rows, X_unroll_cols, Y_unroll_rows, Y_unroll_cols)
+matrix_multiply(float* Y, float* X_unrolled, float* K, int K_unroll_rows, int K_unroll_cols, int X_unroll_rows, int X_unroll_cols, int Y_unroll_rows, int Y_unroll_cols)
 {
   float value = 0;
   int row = blockIdx.x*blockDim.x + threadIdx.x;
   int column = blockIdx.y*blockDim.y + threadIdx.x;
 
   if(row < K_unroll_rows && column < X_unroll_cols){
-    for (int i = 0; i < K_unroll_cols){
+    for (int i = 0; i < K_unroll_cols; i++){
       value += K[row * K_unroll_cols + i] * X_unrolled[(X_unroll_cols*X_unroll_rows)*blockIdx.z + i*X_unroll_cols + column];
     }
     Y[(Y_unroll_rows*Y_unroll_cols)*blockIdx.z + row*Y_unroll_cols + column] = value;
@@ -142,7 +142,7 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tenso
     const int H = x.shape_[2]; //height of output elements
     const int W = x.shape_[3]; //width of output element
     const int K = w.shape_[3]; //dimension of the filters, width and height
-
+    printf("Reached");
     // Set the kernel dimensions
     const int H_out = H - K + 1; // the output after removing the edges
     const int W_out = W - K + 1;
@@ -167,18 +167,21 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tenso
     int weightSize = M * C * K * K;
     //copy to constant memory
     cudaMemcpyToSymbol(Mask, w.dptr_, weightSize * sizeof(float));
-    float* X_unrolled = malloc(B*X_unroll_rows * X_unroll_cols * sizeof(float));
+    // float* X_unrolled = malloc(B * X_unroll_rows * X_unroll_cols * sizeof(float));
+    float* X_unrolled;
+    cudaMalloc((void**)&X_unrolled, B * X_unroll_rows * X_unroll_cols * sizeof(float));
     dim3 blockDim(TILE_WIDTH, TILE_WIDTH, 1);
     dim3 gridDim(B, M, Z); //num of output images, number of output feature maps, total tiles
 
     dim3 grid_unroll(ceil(C*H_out*W_out / MAX_NUM_THREADS), B, 1);
     dim3 block_unroll(MAX_NUM_THREADS,1,1);
-    unroll_kernel<<grid_unroll, block_unroll>>(C, H, W, H_out, W_out, X_unroll_cols, K, x.dptr_, X_unrolled);
+    unroll_kernel<<<grid_unroll, block_unroll>>>(C, H, W, H_out, W_out, X_unroll_cols, K, x.dptr_, X_unrolled);
     cudaDeviceSynchronize();
+
 
     dim3 block_mm(16,16,1);
     dim3 grid_mm(ceil(Y_unroll_rows/block_mm.x), ceil(Y_unroll_cols/block_mm.y), B);
-    matrix_multiply<<grid_mm, block_mm>>(y.dptr_, X_unrolled, w.dptr_, K_unroll_rows, K_unroll_cols, X_unroll_rows, X_unroll_cols, Y_unroll_rows, Y_unroll_cols);
+    matrix_multiply<<<grid_mm, block_mm>>>(y.dptr_, X_unrolled, w.dptr_, K_unroll_rows, K_unroll_cols, X_unroll_rows, X_unroll_cols, Y_unroll_rows, Y_unroll_cols);
 
 
     // Call the kernel
