@@ -26,7 +26,7 @@ void forward(mshadow::Tensor<cpu, 4, DType> &y, const mshadow::Tensor<cpu, 4, DT
     const int W = x.shape_[3];
     const int K = k.shape_[3];
 
-    for (int b = 0; b < B; ++b) //number of images
+    for (int b = 0; b < B; ++b)
     {
 
         // CHECK_EQ(0,1) << "Remove this line and replace it with your implementation.";
@@ -34,18 +34,18 @@ void forward(mshadow::Tensor<cpu, 4, DType> &y, const mshadow::Tensor<cpu, 4, DT
         /* ... a bunch of nested loops later...
             y[b][m][h][w] += x[b][c][h + p][w + q] * k[m][c][p][q];
         */
-        for (int m = 0; m < M; ++m) //number of output feature maps
+        for (int m = 0; m < M; ++m)
         {
-            for (int h = 0; h < H; ++h) //height of output elements
+            for (int h = 0; h < H; ++h)
             {
-                for (int w = 0; w < W; ++w)//width of output element
+                for (int w = 0; w < W; ++w)
                 {
-                    y[b][m][h][w] = 0; //sets output to be zero
-                    for (int c = 0; c < C; ++c) //num of input feature maps
+                    y[b][m][h][w] = 0;
+                    for (int c = 0; c < C; ++c)
                     {
-                        for (int p = 0; p < K; ++p) //height of filter
+                        for (int p = 0; p < K; ++p)
                         {
-                            for (int q = 0; q < K; ++q) //width of filter
+                            for (int q = 0; q < K; ++q)
                             {
                                 y[b][m][h][w] += x[b][c][h + p][w + q] * k[m][c][p][q];
                             }
