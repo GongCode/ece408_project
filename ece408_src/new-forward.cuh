@@ -6,17 +6,15 @@
 
 #define TILE_WIDTH 16
 #define CONSTANT_MASK_SIZE 3000
+#define MAX_NUM_THREADS 1024
 
 namespace mxnet
 {
 namespace op
 {
 
-<<<<<<< HEAD
-=======
 __constant__ float Mask[CONSTANT_MASK_SIZE];
 
->>>>>>> 846699c307a93816a6908969c76fcd91d3e25fae
 __global__ void
 forward_kernel(float *y, const float *x, const float *k, const int B, const int M, const int C, const int H, const int W, const int K)
 {
@@ -38,53 +36,38 @@ forward_kernel(float *y, const float *x, const float *k, const int B, const int 
 #define k4d(i3, i2, i1, i0) k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
 #define kConstant4d(i3, i2, i1, i0) Mask[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
 
+    // __shared__ float sharedInput[TILE_WIDTH + K - 1][TILE_WIDTH + K - 1][TILE_WIDTH + K - 1];
+
     n = blockIdx.x; //idx of images
     m = blockIdx.y; //idx of features
-    h0 = threadIdx.x;
-    w0 = threadIdx.y;
     const int H_Grid = ceil(H_out / (float)TILE_WIDTH);
     const int W_Grid = ceil(W_out / (float)TILE_WIDTH); //round up
-    h_base = (blockIdx.z / W_Grid) * TILE_WIDTH;
-    w_base = (blockIdx.z % W_Grid) * TILE_WIDTH;
-    h = h_base + h0; //y idx of output tile
-    w = w_base + w0; //x idx of output tile
+    h = blockIdx.z / (H_Grid)*TILE_WIDTH + threadIdx.y; //y idx of output tile
+    w = blockIdx.z % (W_Grid)*TILE_WIDTH + threadIdx.x; //x idx of output tile
+
+    if (h >= H_out || w >= W_out)
+        return;
 
     float total = 0.0;
 
     //num of input feature maps
+    // #pragma unroll
     for (c = 0; c < C; c++)
     {
-        //load input data into shared memory
-        for (int i = h; i < h_base + X_tile_width; i += TILE_WIDTH)
-        {
-            for (int j = w; j < w_base + X_tile_width; j += TILE_WIDTH)
-            {
-                if (i < H && j < W)
-                {
-                    X_shared[(i - h_base) * X_tile_width + j - w_base] = x4d(n, c, i, j);
-                }
-            }
-        }
-        __syncthreads();
-
         //height of filter
+        // #pragma unroll
         for (p = 0; p < K; p++)
         {
             //width idx of filter
+            // #pragma unroll
             for (q = 0; q < K; q++)
             {
-                total += X_shared[(h0 + p) * X_tile_width + w0 + q] * kConstant4d(m, c, p, q);
+                total += x4d(n, c, h + p, w + q) * k4d(m, c, p, q); // kConstant4d(m, c, p, q);
             }
         }
-        temp = X_shared;
-        X_shared = X_shared2;
-        X_shared2 = temp;
     }
 
-    if (h < H_out && w < W_out)
-    {
-        y4d(n, m, h, w) = total;
-    }
+    y4d(n, m, h, w) = total;
 
     // An example use of these macros:
     // float a = y4d(0,0,0,0)
@@ -93,10 +76,66 @@ forward_kernel(float *y, const float *x, const float *k, const int B, const int 
 #undef y4d
 #undef x4d
 #undef k4d
-#undef kConstant4d
 }
 
-/* 
+__global__ void
+unroll_kernel(int C, int H, int W, int H_out, int W_out, int X_unroll_cols, int K, float *X, float *X_unrolled)
+{
+
+#define x4d(i3, i2, i1, i0) X[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
+#define x_u4d(i2, i1, i0) X_unrolled[(i2) * (X_unroll_cols * C * K * K) + (i1) * (X_unroll_cols) + i0]
+
+    int c, s, h_out, w_out, h_unroll, w_unroll, w_base, p, q;
+
+    int t = blockIdx.x * MAX_NUM_THREADS + threadIdx.x;
+    int n = blockIdx.y; // index of images
+    int Hdim_out = H - K + 1;
+    int Wdim_out = W - K + 1;
+    int W_unroll = Hdim_out * Wdim_out;
+
+    if (t < C * W_unroll)
+    {
+        c = t / W_unroll;
+        s = t % W_unroll;
+        h_out = s / Wdim_out;
+        w_out = s % Wdim_out;
+        w_unroll = h_out * Wdim_out + w_out;
+        w_base = c * K * K;
+
+        h_unroll = h_out * Wdim_out + w_out;
+
+        for (p = 0; p < K; p++)
+        {
+            for (q = 0; q < K; q++)
+            {
+                h_unroll = w_base + p * K + q;
+                // x_u4d(n, h_unroll, w_unroll) = x4d(n, c, h_out + p, w_out + q);
+
+                w_unroll = w_base + p * K + q;
+                x_u4d(n, h_unroll, w_unroll) = x4d(n, c, h_out + p, w_out + q);
+            }
+        }
+    }
+}
+
+__global__ void
+matrix_multiply(float *Y, float *X_unrolled, float *K, int K_unroll_rows, int K_unroll_cols, int X_unroll_rows, int X_unroll_cols, int Y_unroll_rows, int Y_unroll_cols)
+{
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < Y_unroll_rows && col < Y_unroll_cols)
+    {
+        float value = 0;
+        for (int i = 0; i < K_unroll_cols; i++)
+        {
+            value += K[row * K_unroll_cols + i] * X_unrolled[(X_unroll_cols * X_unroll_rows) * blockIdx.z + i * X_unroll_cols + col];
+        }
+        Y[(Y_unroll_rows * Y_unroll_cols) * blockIdx.z + row * Y_unroll_cols + col] = value;
+    }
+}
+
+/*
    This function is called by new-inl.h
    Any code you write should be executed by this function.
    For ECE408, we only expect the float version of the operator to be called, so here we specialize with only floats.
@@ -110,13 +149,14 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tenso
     //CHECK_EQ(0, 1) << "Remove this line and replace with your implementation";
 
     // Extract the tensor dimensions into B,M,C,H,W,K
+
     const int B = x.shape_[0]; //number of output images
     const int M = y.shape_[1]; //number of output feature maps
     const int C = x.shape_[1]; //number of input feature maps
     const int H = x.shape_[2]; //height of output elements
     const int W = x.shape_[3]; //width of output element
     const int K = w.shape_[3]; //dimension of the filters, width and height
-
+    printf("Reached");
     // Set the kernel dimensions
     const int H_out = H - K + 1; // the output after removing the edges
     const int W_out = W - K + 1;
@@ -125,30 +165,54 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tenso
     int H_grid = ceil(H_out / (float)TILE_WIDTH); // number of vertical tiles per output map
     int Z = H_grid * W_grid;
 
-    printf("Optimization #2");
     printf("Num Output Feature Maps: %d ", M);
     printf(" Num Input Feature Maps: %d ", C);
-    printf(" Filter Size: %d ", K);
+    printf(" Filter Size: %d \n", K);
+
+    //Dimensions of matrices to support unrolling
+    int X_unroll_rows = C * K * K;
+    int X_unroll_cols = H_out * W_out;
+    int K_unroll_rows = M;
+    int K_unroll_cols = C * K * K;
+    int Y_unroll_rows = M;
+    int Y_unroll_cols = H_out * W_out;
 
     //define weight size
     int weightSize = M * C * K * K;
     //copy to constant memory
     cudaMemcpyToSymbol(Mask, w.dptr_, weightSize * sizeof(float));
-
+    // float* X_unrolled = malloc(B * X_unroll_rows * X_unroll_cols * sizeof(float));
+    float *X_unrolled;
+    cudaMalloc((void **)&X_unrolled, B * X_unroll_rows * X_unroll_cols * sizeof(float));
     dim3 blockDim(TILE_WIDTH, TILE_WIDTH, 1);
     dim3 gridDim(B, M, Z); //num of output images, number of output feature maps, total tiles
 
-    // allocate space for shared memory
-    size_t shmem_size = sizeof(float) * (TILE_WIDTH + K - 1) * (TILE_WIDTH + K - 1) * 2;
+    printf("Allocated Memory & Copied memory to constant memory \n");
 
     // Call the kernel
-    forward_kernel<<<gridDim, blockDim, shmem_size>>>(y.dptr_, x.dptr_, w.dptr_, B, M, C, H, W, K);
+    // forward_kernel<<<gridDim, blockDim>>>(y.dptr_, x.dptr_, w.dptr_, B, M, C, H, W, K);
+
+    dim3 grid_unroll(ceil((C * H_out * W_out) / (1.0 * MAX_NUM_THREADS)), B, 1);
+    dim3 block_unroll(MAX_NUM_THREADS, 1, 1);
+    unroll_kernel<<<grid_unroll, block_unroll>>>(C, H, W, H_out, W_out, X_unroll_cols, K, x.dptr_, X_unrolled);
+    cudaDeviceSynchronize();
+
+    printf("Post unroll Kernel \n");
+
+    dim3 block_mm(16, 16, 1);
+    dim3 grid_mm(ceil(Y_unroll_rows / 16.0), ceil(Y_unroll_cols / 16.0), B);
+    matrix_multiply<<<grid_mm, block_mm>>>(y.dptr_, X_unrolled, w.dptr_, K_unroll_rows, K_unroll_cols, X_unroll_rows, X_unroll_cols, Y_unroll_rows, Y_unroll_cols);
+
+    printf("Post Matrix Multiply \n");
+
+    // Call the kernel
+    // forward_kernel<<<gridDim, blockDim>>>(y.dptr_, x.dptr_, w.dptr_, B, M, C, H, W, K);
 
     // Use MSHADOW_CUDA_CALL to check for CUDA runtime errors.
     MSHADOW_CUDA_CALL(cudaDeviceSynchronize());
 }
 
-/* 
+/*
     This tells mxnet how to do an op when it's not a float.
     This is not used in the ECE408 project
 */
