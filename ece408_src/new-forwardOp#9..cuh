@@ -4,7 +4,6 @@
 
 #include <mxnet/base.h>
 
-
 #define TILE_WIDTH_1 8
 #define TILE_WIDTH 16
 #define CONSTANT_MASK_SIZE 3000
@@ -71,8 +70,6 @@ forward_kernel_1(float *y, const float *x, const float *k, const int B, const in
 #undef k4d
 }
 
-
-
 __global__ void
 forward_kernel(float *y, const float *x, const float *k, const int B, const int M, const int C, const int H, const int W, const int K)
 {
@@ -130,7 +127,6 @@ forward_kernel(float *y, const float *x, const float *k, const int B, const int 
 #undef k4d
 }
 
-
 /* 
    This function is called by new-inl.h
    Any code you write should be executed by this function.
@@ -165,24 +161,26 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tenso
     printf(" Num Input Feature Maps: %d ", C);
     printf(" Filter Size: %d ", K);
 
-    if(C == 1){
+    if (C == 1)
+    {
         dim3 blockDim(TILE_WIDTH_1, TILE_WIDTH_1, 1);
         dim3 gridDim(B, M, Z); //num of output images, number of output feature maps, total tiles
         // Call the kernel
         forward_kernel_1<<<gridDim, blockDim>>>(y.dptr_, x.dptr_, w.dptr_, B, M, C, H, W, K);
-    }else{
+    }
+    else if (C == 6)
+    {
         dim3 blockDim(TILE_WIDTH, TILE_WIDTH, 1);
         dim3 gridDim(B, M, Z); //num of output images, number of output feature maps, total tiles
         // Call the kernel
         forward_kernel<<<gridDim, blockDim>>>(y.dptr_, x.dptr_, w.dptr_, B, M, C, H, W, K);
-
     }
 
-    dim3 blockDim(TILE_WIDTH, TILE_WIDTH, 1);
-    dim3 gridDim(B, M, Z); //num of output images, number of output feature maps, total tiles
+    // dim3 blockDim(TILE_WIDTH, TILE_WIDTH, 1);
+    // dim3 gridDim(B, M, Z); //num of output images, number of output feature maps, total tiles
 
-    // Call the kernel
-    forward_kernel<<<gridDim, blockDim>>>(y.dptr_, x.dptr_, w.dptr_, B, M, C, H, W, K);
+    // // Call the kernel
+    // forward_kernel<<<gridDim, blockDim>>>(y.dptr_, x.dptr_, w.dptr_, B, M, C, H, W, K);
 
     // Use MSHADOW_CUDA_CALL to check for CUDA runtime errors.
     MSHADOW_CUDA_CALL(cudaDeviceSynchronize());
