@@ -4,9 +4,10 @@
 
 #include <mxnet/base.h>
 
-#define TILE_WIDTH 16
+#define TILE_WIDTH 32
 #define CONSTANT_MASK_SIZE 3000
 #define MAX_NUM_THREADS 1024
+
 
 namespace mxnet
 {
@@ -79,60 +80,89 @@ forward_kernel(float *y, const float *x, const float *k, const int B, const int 
 }
 
 __global__ void
-unroll_kernel(int C, int H, int W, int H_out, int W_out, int X_unroll_cols, int K, float *X, float *X_unrolled)
+unroll_kernel(float *X_unrolled, int size, float *X, int C, int K, int H, int W)
 {
 
 #define x4d(i3, i2, i1, i0) X[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
 #define x_u4d(i2, i1, i0) X_unrolled[(i2) * (X_unroll_cols * C * K * K) + (i1) * (X_unroll_cols) + i0]
 
-  int c, s, h_out, w_out, h_unroll, w_unroll, w_base, p, q;
+  //index of thread in unrolled matrix
+  int index = blockDim.x * blockIdx.x + threadIdx.x;
+  if (index >= size)
+    return;
+  //output dimensions
+  int H_out = H - K + 1;
+  int W_out = W - K + 1;
+  int outputSize = H_out * W_out;
+  //index into the output images of row and col
+  int row = index / outputSize;
+  int col = index % outputSize;
+  //p and q are used to unroll according to kernel size
+  int q = row % K;
+  row /= K;
+  int p = row % K;
+  //c is input featur map index?
+  int c = row / K;
+  //h and w are of specific X input height and width indices
+  int w = col % W_out;
+  int h = col / W_out;
 
-  int t = blockIdx.x * MAX_NUM_THREADS + threadIdx.x;
-  int n = blockIdx.y; // index of images
-  int Hdim_out = H - K + 1;
-  int Wdim_out = W - K + 1;
-  int W_unroll = Hdim_out * Wdim_out;
+  X_unrolled[index] = X[c * (H*W) + (h+p)*W + w+q];
+}
 
-  if (t < C * W_unroll)
-  {
-    c = t / W_unroll;
-    s = t % W_unroll;
-    h_out = s / Wdim_out;
-    w_out = s % Wdim_out;
-    w_unroll = h_out * Wdim_out + w_out;
-    w_base = c * K * K;
-
-    h_unroll = h_out * Wdim_out + w_out;
-
-    for (p = 0; p < K; p++)
-    {
-      for (q = 0; q < K; q++)
-      {
-        h_unroll = w_base + p * K + q;
-        // x_u4d(n, h_unroll, w_unroll) = x4d(n, c, h_out + p, w_out + q);
-
-        w_unroll = w_base + p * K + q;
-        x_u4d(n, h_unroll, w_unroll) = x4d(n, c, h_out + p, w_out + q);
-      }
-    }
-  }
+void unroll(float* X_unrolled, int size, float* X, int C, int K, int H, int W){
+  int gridDim = ceil((1.0*size)/(1.0 * MAX_NUM_THREADS));
+  unrollKernel<<<gridDim, MAX_NUM_THREADS>>>(X_unrolled, size, X, C, K, H, W);
 }
 
 __global__ void
-matrix_multiply(float *Y, float *X_unrolled, float *K, int K_unroll_rows, int K_unroll_cols, int X_unroll_rows, int X_unroll_cols, int Y_unroll_rows, int Y_unroll_cols)
+matrix_multiply_shared(float* A, float* B, float* C, int numAColumns, int numCRows, int numCColumns)
 {
-  int row = blockIdx.y * blockDim.y + threadIdx.y;
-  int col = blockIdx.x * blockDim.x + threadIdx.x;
+  __shared__ float subTileM[TILE_WIDTH][TILE_WIDTH];
+  __shared__ float subTileN[TILE_WIDTH][TILE_WIDTH];
+  
+  int by = blockIdx.y;
+  int bx = blockIdx.x;
+  
+  int ty = threadIdx.y;
+  int tx = threadIdx.x;
+  
+  int Row = by * TILE_WIDTH + ty;
+  int Col = bx * TILE_WIDTH + tx;
+  
+  float Pvalue = 0;
+  
+  for(int m = 0; m < ceil(numAColumns/(float)TILE_WIDTH); m++){
 
-  if (row < Y_unroll_rows && col < Y_unroll_cols)
-  {
-    float value = 0;
-    for (int i = 0; i < K_unroll_cols; i++)
-    {
-      value += K[row * K_unroll_cols + i] * X_unrolled[(X_unroll_cols * X_unroll_rows) * blockIdx.z + i * X_unroll_cols + col];
+    int idxCol = m*TILE_WIDTH+threadIdx.x;
+    if (col < numAColumns)
+      subTileM[ty][tx] = A[Row*numAColumns+idxCol];
+    else
+      subTileM[tyy][tx] = 0;
+
+    int idxRow = m*TILE_WIDTH+threadIdx.y;
+    if (row < numAColumns)
+      subTileN[ty][tx] = B[idxRow*numCColumns + Col];
+    else 
+      subTileN[ty][tx] = 0;
+    
+    __syncthreads();
+    
+    for(int k = 0; k < TILE_WIDTH; k++){
+      Pvalue += subTileM[ty][k] * subTileN[k][tx];
     }
-    Y[(Y_unroll_rows * Y_unroll_cols) * blockIdx.z + row * Y_unroll_cols + col] = value;
+    __syncthreads();
+    
   }
+  if(Row < numCRows && Col < numCColumns)
+    C[Row*numCColumns + Col] = Pvalue;
+}
+
+void gemm(float* W, float* X_unrolled, float* Y, int CKK, int M, int outputSize)
+{
+  dim3 gridDim(ceil(1.0*outputSize/TILE_WIDTH), ceil(1.0*M/TILE_WIDTH));
+  dim3 blockDim(TILE_WIDTH, TILE_WIDTH);
+  matrix_multiply_shared<<<gridDim, blockDim>>>(W, X_unrolled, Y, CKK, M, outputSize);
 }
 
 /*
@@ -156,57 +186,39 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tenso
   const int H = x.shape_[2]; //height of output elements
   const int W = x.shape_[3]; //width of output element
   const int K = w.shape_[3]; //dimension of the filters, width and height
-  printf("Reached");
   // Set the kernel dimensions
   const int H_out = H - K + 1; // the output after removing the edges
   const int W_out = W - K + 1;
 
-  int W_grid = ceil(W_out / (float)TILE_WIDTH); // number of horizontal tiles per output map
-  int H_grid = ceil(H_out / (float)TILE_WIDTH); // number of vertical tiles per output map
-  int Z = H_grid * W_grid;
+  float* Y = y.dptr_;
+  float* X = x.dptr_;
+  float* W = w.dptr_;
 
-  printf("Num Output Feature Maps: %d ", M);
-  printf(" Num Input Feature Maps: %d ", C);
-  printf(" Filter Size: %d \n", K);
+  // int W_grid = ceil(W_out / (float)TILE_WIDTH); // number of horizontal tiles per output map
+  // int H_grid = ceil(H_out / (float)TILE_WIDTH); // number of vertical tiles per output map
+  // int Z = H_grid * W_grid;
 
-  //Dimensions of matrices to support unrolling
-  int X_unroll_rows = C * K * K;
-  int X_unroll_cols = H_out * W_out;
-  int K_unroll_rows = M;
-  int K_unroll_cols = C * K * K;
-  int Y_unroll_rows = M;
-  int Y_unroll_cols = H_out * W_out;
+  // printf("Num Output Feature Maps: %d ", M);
+  // printf(" Num Input Feature Maps: %d ", C);
+  // printf(" Filter Size: %d \n", K);
 
-  //define weight size
+  //define sizes
+  int outputSize = H_out*W_out;
+  int unrollSize = C*K*K*outputSize;
   int weightSize = M * C * K * K;
   //copy to constant memory
-  cudaMemcpyToSymbol(Mask, w.dptr_, weightSize * sizeof(float));
+  // cudaMemcpyToSymbol(Mask, w.dptr_, weightSize * sizeof(float));
   // float* X_unrolled = malloc(B * X_unroll_rows * X_unroll_cols * sizeof(float));
   float *X_unrolled;
   cudaMalloc((void **)&X_unrolled, B * X_unroll_rows * X_unroll_cols * sizeof(float));
-  dim3 blockDim(TILE_WIDTH, TILE_WIDTH, 1);
-  dim3 gridDim(B, M, Z); //num of output images, number of output feature maps, total tiles
 
-  printf("Allocated Memory & Copied memory to constant memory \n");
-
-  // Call the kernel
-  // forward_kernel<<<gridDim, blockDim>>>(y.dptr_, x.dptr_, w.dptr_, B, M, C, H, W, K);
-
-  dim3 grid_unroll(ceil((C * H_out * W_out) / (1.0 * MAX_NUM_THREADS)), B, 1);
-  dim3 block_unroll(MAX_NUM_THREADS, 1, 1);
-  unroll_kernel<<<grid_unroll, block_unroll>>>(C, H, W, H_out, W_out, X_unroll_cols, K, x.dptr_, X_unrolled);
-  cudaDeviceSynchronize();
-
-  printf("Post unroll Kernel \n");
-
-  dim3 block_mm(16, 16, 1);
-  dim3 grid_mm(ceil(Y_unroll_rows / 16.0), ceil(Y_unroll_cols / 16.0), B);
-  matrix_multiply<<<grid_mm, block_mm>>>(y.dptr_, X_unrolled, w.dptr_, K_unroll_rows, K_unroll_cols, X_unroll_rows, X_unroll_cols, Y_unroll_rows, Y_unroll_cols);
-
-  printf("Post Matrix Multiply \n");
-
-  // Call the kernel
-  // forward_kernel<<<gridDim, blockDim>>>(y.dptr_, x.dptr_, w.dptr_, B, M, C, H, W, K);
+  for(int b = B; b--; ){
+    int xOffset = b*C*H*W;
+    int yOffset = b*M*outputSize;
+    unroll(X_unrolled, size, X + xOffset, C, K, H, W);
+    gemm(W, X_unrolled, Y + yOffset, C*K*K, M, outputSize);
+  }
+  cudaFree(X_unrolled);
 
   // Use MSHADOW_CUDA_CALL to check for CUDA runtime errors.
   MSHADOW_CUDA_CALL(cudaDeviceSynchronize());
